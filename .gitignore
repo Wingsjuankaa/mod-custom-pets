@@ -1,0 +1,22 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dll
+cmake-build-*/
+build/
+CMakeFiles/
+
+# IDE
+.idea/
+.vscode/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config local (solo distribuir el .dist)
+conf/*.conf
+!conf/*.conf.dist
+

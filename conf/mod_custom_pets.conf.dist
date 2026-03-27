@@ -1,0 +1,10 @@
+[conf]
+conf_version=2026032601
+
+#
+# CustomPets.Enable
+# Activa o desactiva el módulo de mascotas custom.
+# Default: 1 (Activado)
+#
+CustomPets.Enable = 1
+
