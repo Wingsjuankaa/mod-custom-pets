@@ -262,16 +262,43 @@ public:
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// PlayerScript – limpieza al cerrar sesión
+// PlayerScript – eventos globales de ciclo de vida de la mascota
+//
+//  • OnPlayerLogout    → despide al cerrar sesión
+//  • OnPlayerJustDied  → despide al morir (hook directo disponible)
+//  • OnPlayerUpdate    → detecta transición a montura (no existe hook propio):
+//                        si el jugador monta con una pet activa, la despide.
+//                        El check es barato: solo actúa si Has() devuelve true.
 // ──────────────────────────────────────────────────────────────────────────────
 class CustomPetsPlayerScript : public PlayerScript
 {
 public:
     CustomPetsPlayerScript() : PlayerScript("CustomPetsPlayerScript") {}
 
+    // Cierre de sesión
     void OnPlayerLogout(Player* player) override
     {
         DismissActivePet(player);
+    }
+
+    // Muerte del jugador
+    void OnPlayerJustDied(Player* player) override
+    {
+        if (!sCustomPetsTracker->Has(player->GetGUID().GetCounter()))
+            return;
+
+        DismissActivePet(player);
+    }
+
+    // Detección de montura: se dispara en el tick en que IsMounted() pasa a true
+    // OnPlayerUpdate se llama cada tick; el guard de Has() lo hace eficiente.
+    void OnPlayerUpdate(Player* player, uint32 /*diff*/) override
+    {
+        if (!sCustomPetsTracker->Has(player->GetGUID().GetCounter()))
+            return;
+
+        if (player->IsMounted())
+            DismissActivePet(player);
     }
 };
 
