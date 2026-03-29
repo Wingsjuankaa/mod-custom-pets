@@ -4,6 +4,7 @@
 #include "Log.h"
 #include "Chat.h"
 #include "Map.h"
+#include "ObjectAccessor.h"
 #include <cmath>
 
 #ifndef M_PI
@@ -19,8 +20,8 @@ void CustomPetsMgr::LoadFromDB()
     _pets.clear();
 
     QueryResult result = WorldDatabase.Query(
-        "SELECT id, name, type, creature_entry, description, enabled "
-        "FROM mod_custom_pets");
+            "SELECT id, name, type, creature_entry, description, speed, item_entry, spell_id, enabled "
+            "FROM mod_custom_pets");
 
     if (!result)
     {
@@ -38,7 +39,10 @@ void CustomPetsMgr::LoadFromDB()
         data.type           = fields[2].Get<uint8>();
         data.creature_entry = fields[3].Get<uint32>();
         data.description    = fields[4].Get<std::string>();
-        data.enabled        = fields[5].Get<bool>();
+        data.speed          = fields[5].Get<float>();
+        data.item_entry     = fields[6].Get<uint32>();
+        data.spell_id       = fields[7].Get<uint32>();
+        data.enabled        = fields[8].Get<bool>();
 
         _pets.push_back(std::move(data));
     } while (result->NextRow());
@@ -60,10 +64,113 @@ bool CustomPetsMgr::GetById(uint32 id, CustomPetData& out) const
     return false;
 }
 
+bool CustomPetsMgr::GetPetByItemEntry(uint32 itemEntry, CustomPetData& out) const
+{
+    if (itemEntry == 0)
+        return false;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (const auto& p : _pets)
+    {
+        if (p.item_entry == itemEntry && p.enabled)
+        {
+            out = p;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CustomPetsMgr::GetPetBySpellId(uint32 spellId, CustomPetData& out) const
+{
+    if (spellId == 0)
+        return false;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (const auto& p : _pets)
+    {
+        if (p.spell_id == spellId && p.enabled)
+        {
+            out = p;
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<CustomPetData> CustomPetsMgr::GetAll() const
 {
     std::lock_guard<std::mutex> lock(_mutex);
     return _pets;
+}
+
+// ── Sistema de mascotas aprendidas ────────────────────────────────────────────
+
+void CustomPetsMgr::LoadPlayerPets(uint32 playerGuid)
+{
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT pet_id FROM mod_custom_pets_learned WHERE player_guid = {}",
+        playerGuid);
+
+    std::lock_guard<std::mutex> lock(_learnedMutex);
+    auto& petSet = _learnedPets[playerGuid];
+    petSet.clear();
+
+    if (!result)
+        return;
+
+    do
+    {
+        petSet.insert(result->Fetch()[0].Get<uint32>());
+    } while (result->NextRow());
+}
+
+void CustomPetsMgr::UnloadPlayerPets(uint32 playerGuid)
+{
+    std::lock_guard<std::mutex> lock(_learnedMutex);
+    _learnedPets.erase(playerGuid);
+}
+
+bool CustomPetsMgr::HasLearnedPet(uint32 playerGuid, uint32 petId) const
+{
+    std::lock_guard<std::mutex> lock(_learnedMutex);
+    auto it = _learnedPets.find(playerGuid);
+    if (it == _learnedPets.end())
+        return false;
+    return it->second.count(petId) > 0;
+}
+
+void CustomPetsMgr::LearnPet(uint32 playerGuid, uint32 petId)
+{
+    // Persiste en la base de datos de personajes
+    CharacterDatabase.Execute(
+        "INSERT IGNORE INTO mod_custom_pets_learned (player_guid, pet_id) VALUES ({}, {})",
+        playerGuid, petId);
+
+    // Actualiza la caché en memoria
+    std::lock_guard<std::mutex> lock(_learnedMutex);
+    _learnedPets[playerGuid].insert(petId);
+}
+
+std::vector<CustomPetData> CustomPetsMgr::GetLearnedPets(uint32 playerGuid) const
+{
+    std::vector<CustomPetData> result;
+
+    std::unordered_set<uint32> learnedIds;
+    {
+        std::lock_guard<std::mutex> lock(_learnedMutex);
+        auto it = _learnedPets.find(playerGuid);
+        if (it != _learnedPets.end())
+            learnedIds = it->second;
+    }
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (const auto& p : _pets)
+    {
+        if (p.enabled && learnedIds.count(p.id))
+            result.push_back(p);
+    }
+    return result;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -102,7 +209,7 @@ bool CustomPetsTracker::Has(uint32 playerKey) const
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// DismissActivePet – helper global (declarado en CustomPets.h)
+// DismissActivePet – helper global
 // ──────────────────────────────────────────────────────────────────────────────
 void DismissActivePet(Player* player)
 {
@@ -119,7 +226,7 @@ void DismissActivePet(Player* player)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Comandos: .custompet summon / dismiss / list / reload
+// Comandos: .custompet summon / dismiss / list / mylist / give / reload
 // ──────────────────────────────────────────────────────────────────────────────
 using namespace Acore::ChatCommands;
 
@@ -135,6 +242,8 @@ public:
             { "summon",  HandleSummonCommand,  SEC_PLAYER,        Console::No  },
             { "dismiss", HandleDismissCommand, SEC_PLAYER,        Console::No  },
             { "list",    HandleListCommand,    SEC_PLAYER,        Console::No  },
+            { "mylist",  HandleMyListCommand,  SEC_PLAYER,        Console::No  },
+            { "give",    HandleGiveCommand,    SEC_ADMINISTRATOR, Console::No  },
             { "reload",  HandleReloadCommand,  SEC_ADMINISTRATOR, Console::No  },
         };
         static ChatCommandTable rootTable =
@@ -144,7 +253,9 @@ public:
         return rootTable;
     }
 
-    // .custompet summon <id>
+    // ── .custompet summon <id> ────────────────────────────────────────────
+    // Jugadores normales: requiere tener la mascota aprendida.
+    // Administradores: pueden invocar cualquier mascota sin aprenderla.
     static bool HandleSummonCommand(ChatHandler* handler, uint32 petId)
     {
         if (!sConfigMgr->GetOption<bool>("CustomPets.Enable", true))
@@ -155,9 +266,7 @@ public:
         }
 
         Player* player = handler->GetSession()->GetPlayer();
-
-        // Despedir mascota anterior si ya había una activa
-        DismissActivePet(player);
+        bool isAdmin   = handler->GetSession()->GetSecurity() >= SEC_ADMINISTRATOR;
 
         CustomPetData petData;
         if (!sCustomPetsMgr->GetById(petId, petData))
@@ -167,6 +276,23 @@ public:
                 petId);
             return false;
         }
+
+        // Comprobar si la mascota ha sido aprendida (los admins se saltan este control)
+        if (!isAdmin && !sCustomPetsMgr->HasLearnedPet(player->GetGUID().GetCounter(), petId))
+        {
+            std::string itemHint;
+            if (petData.item_entry > 0)
+                itemHint = " Busca el tomo correspondiente para aprenderla.";
+
+            handler->PSendSysMessage(
+                "|cffff4444No has aprendido la mascota '{}' todavía.|r"
+                "|cffaaaaaa{}|r",
+                petData.name, itemHint);
+            return false;
+        }
+
+        // Despedir mascota anterior si ya había una activa
+        DismissActivePet(player);
 
         // Invocar a espaldas del jugador
         float o      = player->GetOrientation();
@@ -188,8 +314,13 @@ public:
             return false;
         }
 
-        // La mascota sigue al jugador
         pet->GetMotionMaster()->MoveFollow(player, 2.0f, (float)M_PI);
+
+        if (petData.speed != 1.0f)
+        {
+            pet->SetSpeed(MOVE_RUN,  petData.speed, true);
+            pet->SetSpeed(MOVE_WALK, petData.speed, true);
+        }
 
         sCustomPetsTracker->Set(player->GetGUID().GetCounter(), pet->GetGUID(), petData.type);
 
@@ -201,7 +332,7 @@ public:
         return true;
     }
 
-    // .custompet dismiss
+    // ── .custompet dismiss ───────────────────────────────────────────────
     static bool HandleDismissCommand(ChatHandler* handler)
     {
         Player* player = handler->GetSession()->GetPlayer();
@@ -218,7 +349,8 @@ public:
         return true;
     }
 
-    // .custompet list
+    // ── .custompet list ───────────────────────────────────────────────────
+    // Muestra todas las mascotas disponibles (aprenderlas o no).
     static bool HandleListCommand(ChatHandler* handler)
     {
         auto pets = sCustomPetsMgr->GetAll();
@@ -230,6 +362,8 @@ public:
             return true;
         }
 
+        uint32 playerGuid = handler->GetSession()->GetPlayer()->GetGUID().GetCounter();
+
         handler->PSendSysMessage(
             "|cffffff00=== Mascotas Custom disponibles ({}) ===|r",
             (uint32)pets.size());
@@ -240,18 +374,108 @@ public:
                 ? "|cff00ff00[ON] |r"
                 : "|cffff4444[OFF]|r";
 
+            bool learned = sCustomPetsMgr->HasLearnedPet(playerGuid, p.id);
+            const char* learnedStr = learned ? "|cff00ff00[Aprendida]|r " : "";
+
             handler->PSendSysMessage(
-                " {}  |cffffff00[{}]|r |cffaaddff{}|r |cffddaa44({})|r"
-                "  |cffaaaaaa{}|r"
-                "  |cff888888→ .custompet summon {}|r",
-                stateStr, p.id, p.name, GetCustomPetTypeName(p.type),
-                p.description, p.id);
+                " {}{}  |cffffff00[{}]|r |cffaaddff{}|r |cffddaa44({})|r"
+                "  |cffaaaaaa{}|r",
+                stateStr, learnedStr, p.id, p.name,
+                GetCustomPetTypeName(p.type), p.description);
         }
 
         return true;
     }
 
-    // .custompet reload
+    // ── .custompet mylist ─────────────────────────────────────────────────
+    // Muestra únicamente las mascotas que el jugador ha aprendido,
+    // con el comando para invocarlas.
+    static bool HandleMyListCommand(ChatHandler* handler)
+    {
+        Player* player   = handler->GetSession()->GetPlayer();
+        uint32 playerKey = player->GetGUID().GetCounter();
+
+        auto pets = sCustomPetsMgr->GetLearnedPets(playerKey);
+
+        if (pets.empty())
+        {
+            handler->SendSysMessage(
+                "|cffffff00No has aprendido ninguna mascota todavía.|r "
+                "|cffaaaaaa(Usa .custompet list para ver las disponibles)|r");
+            return true;
+        }
+
+        // Comprueba si hay alguna activa ahora mismo
+        uint8 activeType = sCustomPetsTracker->GetType(playerKey);
+
+        handler->PSendSysMessage(
+            "|cffffff00=== Tus mascotas aprendidas ({}) ===|r",
+            (uint32)pets.size());
+
+        for (const auto& p : pets)
+        {
+            bool isActive = sCustomPetsTracker->Has(playerKey) && (activeType == p.type);
+
+            handler->PSendSysMessage(
+                " |cffaaddff{}|r |cffddaa44({})|r{}  "
+                "|cffaaaaaa→ .custompet summon {}|r",
+                p.name,
+                GetCustomPetTypeName(p.type),
+                isActive ? " |cff00ff00[Activa]|r" : "",
+                p.id);
+        }
+
+        return true;
+    }
+
+    // ── .custompet give <id> ─────────────────────────────────────────────
+    // Comando de administrador: enseña una mascota al jugador seleccionado
+    // (o al admin si no hay objetivo seleccionado).
+    static bool HandleGiveCommand(ChatHandler* handler, uint32 petId)
+    {
+        Player* target = handler->getSelectedPlayer();
+        if (!target)
+            target = handler->GetSession()->GetPlayer();
+
+        CustomPetData petData;
+        if (!sCustomPetsMgr->GetById(petId, petData))
+        {
+            handler->PSendSysMessage(
+                "|cffff4444No existe ninguna mascota con ID {} o está desactivada.|r",
+                petId);
+            return false;
+        }
+
+        uint32 targetGuid = target->GetGUID().GetCounter();
+
+        if (sCustomPetsMgr->HasLearnedPet(targetGuid, petId))
+        {
+            handler->PSendSysMessage(
+                "|cffffff00{} ya conoce la mascota '{}'.|r",
+                target->GetName(), petData.name);
+            return true;
+        }
+
+        sCustomPetsMgr->LearnPet(targetGuid, petId);
+
+        // Notificar al jugador objetivo
+        ChatHandler(target->GetSession()).PSendSysMessage(
+            "|cff00ff00Has aprendido la mascota: {}!|r "
+            "|cffaaaaaa(Usa .custompet summon {} para invocarla)|r",
+            petData.name, petId);
+
+        // Notificar al admin
+        if (target != handler->GetSession()->GetPlayer())
+        {
+            handler->PSendSysMessage(
+                "|cff00ff00Mascota '{}' enseñada a {}.|r",
+                petData.name, target->GetName());
+        }
+
+        return true;
+    }
+
+    // ── .custompet reload ─────────────────────────────────────────────────
     static bool HandleReloadCommand(ChatHandler* handler)
     {
         sCustomPetsMgr->LoadFromDB();
@@ -263,22 +487,23 @@ public:
 
 // ──────────────────────────────────────────────────────────────────────────────
 // PlayerScript – eventos globales de ciclo de vida de la mascota
-//
-//  • OnPlayerLogout    → despide al cerrar sesión
-//  • OnPlayerJustDied  → despide al morir (hook directo disponible)
-//  • OnPlayerUpdate    → detecta transición a montura (no existe hook propio):
-//                        si el jugador monta con una pet activa, la despide.
-//                        El check es barato: solo actúa si Has() devuelve true.
 // ──────────────────────────────────────────────────────────────────────────────
 class CustomPetsPlayerScript : public PlayerScript
 {
 public:
     CustomPetsPlayerScript() : PlayerScript("CustomPetsPlayerScript") {}
 
-    // Cierre de sesión
+    // Login: carga las mascotas aprendidas del jugador en la caché
+    void OnPlayerLogin(Player* player) override
+    {
+        sCustomPetsMgr->LoadPlayerPets(player->GetGUID().GetCounter());
+    }
+
+    // Cierre de sesión: libera la caché y despide la mascota
     void OnPlayerLogout(Player* player) override
     {
         DismissActivePet(player);
+        sCustomPetsMgr->UnloadPlayerPets(player->GetGUID().GetCounter());
     }
 
     // Muerte del jugador
@@ -290,8 +515,7 @@ public:
         DismissActivePet(player);
     }
 
-    // Detección de montura: se dispara en el tick en que IsMounted() pasa a true
-    // OnPlayerUpdate se llama cada tick; el guard de Has() lo hace eficiente.
+    // Detección de montura
     void OnPlayerUpdate(Player* player, uint32 /*diff*/) override
     {
         if (!sCustomPetsTracker->Has(player->GetGUID().GetCounter()))
@@ -317,20 +541,16 @@ public:
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Registro global: scripts compartidos + scripts de cada tipo de mascota.
-// Para añadir un tipo nuevo: crea CustomPetXxx.cpp, declara AddCustomPetXxxScripts()
-// en CustomPets.h y llámala aquí.
+// Registro global
 // ──────────────────────────────────────────────────────────────────────────────
 void AddCustomPetsScripts()
 {
-    // Infraestructura compartida
     new CustomPets_CommandScript();
     new CustomPetsPlayerScript();
     new CustomPetsWorldScript();
 
-    // Scripts por tipo de mascota
     AddCustomPetVendorScripts();
     AddCustomPetLooterScripts();
-    // AddCustomPetBankerScripts();   // futuro
-    // AddCustomPetRepairScripts();   // futuro
+    AddCustomPetLearnSystemScripts();
+    AddCustomPetCompanionSpellScripts();
 }
