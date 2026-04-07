@@ -1,10 +1,14 @@
-[conf]
-conf_version=2026032601
+#
+# Custom Pets Module Configuration
+#
+
+[worldserver]
 
 #
-# CustomPets.Enable
-# Activa o desactiva el módulo de mascotas custom.
-# Default: 1 (Activado)
+#    CustomPets.Enable
+#        Description: Activa o desactiva el módulo de mascotas custom.
+#        Default:     1 (Activado)
+#                     0 (Desactivado)
 #
 CustomPets.Enable = 1
 
